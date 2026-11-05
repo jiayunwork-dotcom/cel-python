@@ -187,6 +187,7 @@ For example, there may be the following sequence:
 """
 
 import datetime
+import ipaddress
 import logging
 import re
 from functools import reduce, wraps
@@ -1486,6 +1487,276 @@ class MessageType(MapType):
             raise TypeError(r"Expected dictionary or fields, not {args!r}")
         else:
             super().__init__({StringType(k): v for k, v in fields.items()})
+
+
+# CEL network extension (``net.IP`` / ``net.CIDR``).
+#
+# The parsing rules follow the CEL network extension conformance tests:
+# zones are rejected, an IPv4-mapped IPv6 address written with a dotted-decimal
+# suffix (``::ffff:192.168.0.1``) is rejected, while the hexadecimal form
+# (``::ffff:c0a8:1``) is accepted and normalized to its IPv4 address.
+
+# Strict dotted-decimal IPv4: exactly four decimal octets without leading zeros.
+_IPV4_ADDRESS_PATTERN = re.compile(
+    r"^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}$"
+)
+# Hexadecimal IPv6 text -- no zones, no embedded dotted suffix.
+_IPV6_ADDRESS_PATTERN = re.compile(r"^[0-9A-Fa-f:.]+$")
+# Decimal prefix length without leading zeros.
+_PREFIX_LENGTH_PATTERN = re.compile(r"^(?:0|[1-9][0-9]*)$")
+
+
+def parse_net_ip(raw: str) -> "IPAddressType":
+    """
+    Parse a CEL network extension IP address string.
+
+    IPv4 and IPv6 are both supported. Raises :class:`ValueError` for any text
+    that is not a legal, canonicalizable IP address: zones, the dotted-decimal
+    form of an IPv4-mapped IPv6 address (``::ffff:192.168.0.1``) and other
+    malformed text are rejected. The hexadecimal form (``::ffff:c0a8:1``) is
+    accepted and normalized to the equivalent IPv4 value.
+    """
+    if not isinstance(raw, str):
+        raise TypeError(f"IP address must be a string, not {type(raw).__name__}")
+    if "%" in raw:
+        raise ValueError("IP Address with zone value is not allowed")
+    if ":" in raw and "." in raw:
+        # IPv6 text with an embedded dotted-decimal IPv4 suffix. The v4-mapped
+        # form (::ffff:a.b.c.d) is rejected; other forms are kept as IPv6.
+        try:
+            candidate = ipaddress.IPv6Address(raw)
+        except ValueError:
+            raise ValueError(
+                f"IP Address '{raw}' parse error during conversion from string"
+            )
+        if candidate.ipv4_mapped is not None:
+            raise ValueError("IPv4-mapped IPv6 address is not allowed")
+        return IPAddressType(candidate)
+    if ":" in raw:
+        if not _IPV6_ADDRESS_PATTERN.match(raw):
+            raise ValueError(
+                f"IP Address '{raw}' parse error during conversion from string"
+            )
+        try:
+            candidate = ipaddress.IPv6Address(raw)
+        except ValueError:
+            raise ValueError(
+                f"IP Address '{raw}' parse error during conversion from string"
+            )
+        return IPAddressType(candidate)
+    if _IPV4_ADDRESS_PATTERN.match(raw):
+        try:
+            return IPAddressType(ipaddress.IPv4Address(raw))
+        except ValueError:
+            pass
+    raise ValueError(
+        f"IP Address '{raw}' parse error during conversion from string"
+    )
+
+
+def parse_net_cidr(raw: str) -> "CIDRType":
+    """
+    Parse a CEL network extension CIDR string.
+
+    The text must be an IP address, a single slash and a decimal prefix length
+    without leading zeros and within the address family's range. Host bits are
+    preserved: ``192.168.1.5/24`` is valid and distinct from
+    ``192.168.1.0/24`` until :meth:`CIDRType.masked` is used.
+    """
+    if not isinstance(raw, str):
+        raise TypeError(f"network address must be a string, not {type(raw).__name__}")
+    parts = raw.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(
+            "network address parse error during conversion from string"
+        )
+    address_text, prefix_text = parts
+    if "%" in address_text:
+        raise ValueError("CIDR with zone value is not allowed")
+    address = parse_net_ip(address_text)
+    if not _PREFIX_LENGTH_PATTERN.match(prefix_text):
+        raise ValueError(
+            "network address parse error during conversion from string"
+        )
+    prefix_length = int(prefix_text)
+    width = 32 if isinstance(address.address, ipaddress.IPv4Address) else 128
+    if prefix_length > width:
+        raise ValueError(
+            f"prefix length {prefix_length} out of range for IP address type"
+        )
+    return CIDRType(address, prefix_length)
+
+
+class IPAddressType:
+    """
+    CEL ``net.IP`` value -- an IPv4 or IPv6 address.
+
+    Instances are created by ``ip(string)``. Equality compares address values,
+    treating the hexadecimal IPv4-mapped form (``::ffff:c0a8:1``) as equal to
+    the corresponding IPv4 address; IPv6 comparison is case-insensitive.
+    """
+
+    __slots__ = ("address",)
+
+    def __init__(
+        self, address: Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
+    ) -> None:
+        if isinstance(address, ipaddress.IPv6Address):
+            mapped = address.ipv4_mapped
+            if mapped is not None:
+                # Hexadecimal IPv4-mapped form normalizes to IPv4.
+                address = mapped
+        self.address = address
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, IPAddressType):
+            return self.address == other.address
+        # CEL equality across distinct types is false, not an error.
+        return False
+
+    def __ne__(self, other: Any) -> bool:
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash((self.__class__.__name__, self.address))
+
+    def __str__(self) -> str:
+        return str(self.address)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}('{self}')"
+
+    def _is_ipv4(self) -> bool:
+        return isinstance(self.address, ipaddress.IPv4Address)
+
+    def family(self) -> IntType:
+        """4 for IPv4, 6 for IPv6."""
+        return IntType(4 if self._is_ipv4() else 6)
+
+    def isUnspecified(self) -> BoolType:
+        """0.0.0.0 or ::."""
+        return BoolType(self.address.is_unspecified)
+
+    def isLoopback(self) -> BoolType:
+        """127.0.0.0/8 or ::1/128."""
+        return BoolType(self.address.is_loopback)
+
+    def isLinkLocalUnicast(self) -> BoolType:
+        """169.254.0.0/16 or fe80::/10."""
+        return BoolType(self.address.is_link_local)
+
+    def isLinkLocalMulticast(self) -> BoolType:
+        """224.0.0.0/24 for IPv4, or multicast with scope 2 for IPv6 (RFC 4291)."""
+        packed = self.address.packed
+        if self._is_ipv4():
+            return BoolType(packed[0] == 224 and packed[1] == 0 and packed[2] == 0)
+        return BoolType(packed[0] == 0xFF and (packed[1] & 0x0F) == 0x02)
+
+    def isGlobalUnicast(self) -> BoolType:
+        """
+        Global unicast, following Go's ``net/netip.Addr.IsGlobalUnicast``:
+        private IPv4 and unique-local IPv6 addresses still count, but the
+        unspecified, limited broadcast, loopback, multicast and link-local
+        unicast addresses do not.
+        """
+        addr = self.address
+        if self._is_ipv4():
+            if addr in (
+                ipaddress.IPv4Address(0),
+                ipaddress.IPv4Address(0xFFFFFFFF),
+            ):
+                return BoolType(False)
+        elif addr == ipaddress.IPv6Address(0):
+            return BoolType(False)
+        return BoolType(
+            not (
+                addr.is_loopback
+                or addr.is_multicast
+                or addr.is_link_local
+            )
+        )
+
+
+class CIDRType:
+    """
+    CEL ``net.CIDR`` value -- an IP prefix.
+
+    The original address is preserved verbatim, including host bits.
+    Use :meth:`masked` to get the prefix with host bits cleared.
+    """
+
+    __slots__ = ("address", "prefix_length")
+
+    def __init__(self, address: IPAddressType, prefix_length: int) -> None:
+        self.address = address
+        self.prefix_length = int(prefix_length)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, CIDRType):
+            return (
+                self.prefix_length == other.prefix_length
+                and self.address == other.address
+            )
+        return False
+
+    def __ne__(self, other: Any) -> bool:
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash((self.__class__.__name__, self.address, self.prefix_length))
+
+    def __str__(self) -> str:
+        return f"{self.address}/{self.prefix_length}"
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}('{self}')"
+
+    def _width(self) -> int:
+        return 32 if self.address._is_ipv4() else 128
+
+    def ip(self) -> IPAddressType:
+        """The (host-bit preserving) address that precedes the slash."""
+        return self.address
+
+    def prefixLength(self) -> IntType:
+        return IntType(self.prefix_length)
+
+    def masked(self) -> "CIDRType":
+        """A new prefix with all host bits cleared."""
+        width = self._width()
+        shift = width - self.prefix_length
+        value = int(self.address.address)
+        if shift:
+            value = (value >> shift) << shift
+        if self.address._is_ipv4():
+            masked_address = IPAddressType(ipaddress.IPv4Address(value))
+        else:
+            masked_address = IPAddressType(ipaddress.IPv6Address(value))
+        return CIDRType(masked_address, self.prefix_length)
+
+    def containsIP(self, candidate: IPAddressType) -> BoolType:
+        """Whether the prefix contains the given IP address."""
+        if self.address._is_ipv4() != candidate._is_ipv4():
+            # An IPv4 prefix never contains an IPv6 address and vice versa.
+            return BoolType(False)
+        width = self._width()
+        shift = width - self.prefix_length
+        return BoolType(
+            ((int(self.address.address) ^ int(candidate.address)) >> shift) == 0
+        )
+
+    def containsCIDR(self, candidate: "CIDRType") -> BoolType:
+        """Whether the given prefix is the same as or a subnet of this one."""
+        if self.address._is_ipv4() != candidate.address._is_ipv4():
+            return BoolType(False)
+        if candidate.prefix_length < self.prefix_length:
+            return BoolType(False)
+        width = self._width()
+        shift = width - self.prefix_length
+        return BoolType(
+            ((int(self.address.address) ^ int(candidate.address.address)) >> shift)
+            == 0
+        )
 
 
 class TypeType(type):

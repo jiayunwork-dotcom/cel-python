@@ -68,6 +68,7 @@ from typing import (
     List,
     Mapping,
     Match,
+    NoReturn,
     Optional,
     Sequence,
     Sized,
@@ -1114,6 +1115,266 @@ class NameContainer(Dict[str, Referent]):
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({dict(self)}, parent={self.parent})"
+
+
+# CEL network extension.
+#
+# The ``net.IP`` and ``net.CIDR`` value types live in :mod:`celpy.celtypes`.
+# These are the global functions (``ip``, ``cidr``, ``isIP``, ``isCIDR`` and
+# ``ip.isCanonical``) and the member functions used by both the interpreted
+# and transpiled evaluation paths.
+
+
+def _network_parse_error(ex: ValueError) -> NoReturn:
+    """Build a CEL evaluation error from a network parse failure.
+
+    Raised rather than returned so that it propagates through both the
+    interpreted function dispatch and the direct calls of transpiled code.
+    """
+    raise CELEvalError(str(ex), ex.__class__, ex.args)
+
+
+def _network_overload_error(name: str, arg: Any) -> TypeError:
+    """Build a "no such overload" error for a bad argument type."""
+    return TypeError(
+        f"no such overload: {name}() argument has type {type(arg).__name__}"
+    )
+
+
+def function_ip(arg: Any) -> Result:
+    """``ip(string)`` builds a ``net.IP``; ``CIDR.ip()`` returns the prefix address."""
+    if isinstance(arg, celpy.celtypes.CIDRType):
+        return arg.ip()
+    if isinstance(arg, str):
+        try:
+            return celpy.celtypes.parse_net_ip(arg)
+        except ValueError as ex:
+            _network_parse_error(ex)
+    raise _network_overload_error("ip", arg)
+
+
+def function_cidr(arg: Any) -> Result:
+    """``cidr(string)`` builds a ``net.CIDR``."""
+    if isinstance(arg, celpy.celtypes.CIDRType):
+        return arg
+    if isinstance(arg, str):
+        try:
+            return celpy.celtypes.parse_net_cidr(arg)
+        except ValueError as ex:
+            _network_parse_error(ex)
+    raise _network_overload_error("cidr", arg)
+
+
+def function_isIP(arg: Any) -> Result:
+    """``isIP(string)`` -- false for an unparseable string, error for other types."""
+    if isinstance(arg, str):
+        try:
+            celpy.celtypes.parse_net_ip(arg)
+        except ValueError:
+            return celpy.celtypes.BoolType(False)
+        return celpy.celtypes.BoolType(True)
+    raise _network_overload_error("isIP", arg)
+
+
+def function_isCIDR(arg: Any) -> Result:
+    """``isCIDR(string)`` -- false for an unparseable string, error for other types."""
+    if isinstance(arg, str):
+        try:
+            celpy.celtypes.parse_net_cidr(arg)
+        except ValueError:
+            return celpy.celtypes.BoolType(False)
+        return celpy.celtypes.BoolType(True)
+    raise _network_overload_error("isCIDR", arg)
+
+
+def function_ip_isCanonical(arg: Any) -> Result:
+    """
+    ``ip.isCanonical(string)`` -- parse errors propagate, otherwise whether the
+    string is the canonical text form of the address.
+    """
+    if isinstance(arg, str):
+        try:
+            address = celpy.celtypes.parse_net_ip(arg)
+        except ValueError as ex:
+            _network_parse_error(ex)
+        return celpy.celtypes.BoolType(str(address) == arg)
+    raise _network_overload_error("ip.isCanonical", arg)
+
+
+def function_family(arg: Any) -> Result:
+    """``IP.family()``."""
+    if isinstance(arg, CELEvalError):
+        raise arg
+    if isinstance(arg, celpy.celtypes.IPAddressType):
+        return arg.family()
+    raise _network_overload_error("family", arg)
+
+
+def function_isUnspecified(arg: Any) -> Result:
+    """``IP.isUnspecified()``."""
+    if isinstance(arg, CELEvalError):
+        raise arg
+    if isinstance(arg, celpy.celtypes.IPAddressType):
+        return arg.isUnspecified()
+    raise _network_overload_error("isUnspecified", arg)
+
+
+def function_isLoopback(arg: Any) -> Result:
+    """``IP.isLoopback()``."""
+    if isinstance(arg, CELEvalError):
+        raise arg
+    if isinstance(arg, celpy.celtypes.IPAddressType):
+        return arg.isLoopback()
+    raise _network_overload_error("isLoopback", arg)
+
+
+def function_isGlobalUnicast(arg: Any) -> Result:
+    """``IP.isGlobalUnicast()``."""
+    if isinstance(arg, CELEvalError):
+        raise arg
+    if isinstance(arg, celpy.celtypes.IPAddressType):
+        return arg.isGlobalUnicast()
+    raise _network_overload_error("isGlobalUnicast", arg)
+
+
+def function_isLinkLocalUnicast(arg: Any) -> Result:
+    """``IP.isLinkLocalUnicast()``."""
+    if isinstance(arg, CELEvalError):
+        raise arg
+    if isinstance(arg, celpy.celtypes.IPAddressType):
+        return arg.isLinkLocalUnicast()
+    raise _network_overload_error("isLinkLocalUnicast", arg)
+
+
+def function_isLinkLocalMulticast(arg: Any) -> Result:
+    """``IP.isLinkLocalMulticast()``."""
+    if isinstance(arg, CELEvalError):
+        raise arg
+    if isinstance(arg, celpy.celtypes.IPAddressType):
+        return arg.isLinkLocalMulticast()
+    raise _network_overload_error("isLinkLocalMulticast", arg)
+
+
+def function_masked(arg: Any) -> Result:
+    """``CIDR.masked()``."""
+    if isinstance(arg, CELEvalError):
+        raise arg
+    if isinstance(arg, celpy.celtypes.CIDRType):
+        return arg.masked()
+    raise _network_overload_error("masked", arg)
+
+
+def function_prefixLength(arg: Any) -> Result:
+    """``CIDR.prefixLength()``."""
+    if isinstance(arg, CELEvalError):
+        raise arg
+    if isinstance(arg, celpy.celtypes.CIDRType):
+        return arg.prefixLength()
+    raise _network_overload_error("prefixLength", arg)
+
+
+def function_containsIP(prefix: Any, candidate: Any) -> Result:
+    """``CIDR.containsIP(ipOrString)``; mismatched families return false."""
+    if isinstance(prefix, CELEvalError):
+        raise prefix
+    if isinstance(candidate, CELEvalError):
+        raise candidate
+    if not isinstance(prefix, celpy.celtypes.CIDRType):
+        raise _network_overload_error("containsIP", prefix)
+    if isinstance(candidate, str):
+        try:
+            candidate = celpy.celtypes.parse_net_ip(candidate)
+        except ValueError as ex:
+            _network_parse_error(ex)
+    if not isinstance(candidate, celpy.celtypes.IPAddressType):
+        raise _network_overload_error("containsIP", candidate)
+    return prefix.containsIP(candidate)
+
+
+def function_containsCIDR(prefix: Any, candidate: Any) -> Result:
+    """``CIDR.containsCIDR(cidrOrString)``; mismatched families return false."""
+    if isinstance(prefix, CELEvalError):
+        raise prefix
+    if isinstance(candidate, CELEvalError):
+        raise candidate
+    if not isinstance(prefix, celpy.celtypes.CIDRType):
+        raise _network_overload_error("containsCIDR", prefix)
+    if isinstance(candidate, str):
+        try:
+            candidate = celpy.celtypes.parse_net_cidr(candidate)
+        except ValueError as ex:
+            _network_parse_error(ex)
+    if not isinstance(candidate, celpy.celtypes.CIDRType):
+        raise _network_overload_error("containsCIDR", candidate)
+    return prefix.containsCIDR(candidate)
+
+
+base_functions.update(
+    {
+        "ip": function_ip,
+        "cidr": function_cidr,
+        "isIP": function_isIP,
+        "isCIDR": function_isCIDR,
+        "ip.isCanonical": function_ip_isCanonical,
+        "family": function_family,
+        "isUnspecified": function_isUnspecified,
+        "isLoopback": function_isLoopback,
+        "isGlobalUnicast": function_isGlobalUnicast,
+        "isLinkLocalUnicast": function_isLinkLocalUnicast,
+        "isLinkLocalMulticast": function_isLinkLocalMulticast,
+        "masked": function_masked,
+        "prefixLength": function_prefixLength,
+        "containsIP": function_containsIP,
+        "containsCIDR": function_containsCIDR,
+    }
+)
+
+# The ``net`` namespace providing the ``net.IP`` and ``net.CIDR`` type names.
+net_namespace = NameContainer()
+net_namespace["IP"] = Referent(celpy.celtypes.IPAddressType)
+net_namespace["CIDR"] = Referent(celpy.celtypes.CIDRType)
+base_functions["net"] = net_namespace
+
+
+def _activation_has_function(activation: Any, name: str) -> bool:
+    """Whether ``name`` is registered as a global function in ``activation``.
+
+    Tolerates test doubles whose ``functions`` attribute is not a mapping.
+    """
+    functions = getattr(activation, "functions", None)
+    try:
+        return name in functions
+    except TypeError:
+        return False
+
+
+def _bare_member_ident(member_tree: lark.Tree) -> Optional[str]:
+    """
+    Return the identifier name when ``member_tree`` is a bare ``IDENT``
+    primary, otherwise ``None``.
+
+    Lets a qualified global function call such as ``ip.isCanonical(s)`` be
+    distinguished from an ordinary receiver-style member call.
+    """
+    tree: Any = member_tree
+    while (
+        isinstance(tree, lark.Tree)
+        and tree.data == "member"
+        and len(tree.children) == 1
+    ):
+        tree = tree.children[0]
+    if (
+        isinstance(tree, lark.Tree)
+        and tree.data == "primary"
+        and len(tree.children) == 1
+        and isinstance(tree.children[0], lark.Tree)
+        and tree.children[0].data == "ident"
+        and tree.children[0].children
+    ):
+        token = tree.children[0].children[0]
+        if isinstance(token, lark.Token):
+            return token.value
+    return None
 
 
 class Activation:
@@ -2319,6 +2580,28 @@ class Evaluator(lark.visitors.Interpreter[Result]):
             Tuple[lark.Tree, lark.Token], tree.children[:2]
         )
 
+        # A qualified global function call such as ``ip.isCanonical(s)``.
+        # When the left side is a bare identifier and ``ident.method`` names a
+        # registered global function, dispatch the function without treating
+        # the identifier as a receiver.
+        root_name = _bare_member_ident(member_tree)
+        if root_name is not None:
+            qualified_name = f"{root_name}.{method_name_token.value}"
+            if _activation_has_function(self.activation, qualified_name):
+                values: List[Result] = []
+                if len(tree.children) > 2:
+                    values = cast(
+                        List[Result],
+                        self.visit_children(cast(lark.Tree, tree.children[2])),
+                    )
+                qualified_token = lark.Token(
+                    method_name_token.type, qualified_name
+                )
+                qualified_token.start_pos = method_name_token.start_pos
+                qualified_token.line = method_name_token.line
+                qualified_token.column = method_name_token.column
+                return self.function_eval(qualified_token, values)
+
         if method_name_token.value in {
             "map",
             "filter",
@@ -3405,6 +3688,16 @@ class Phase1Transpiler(lark.visitors.Visitor_Recursive):
                 Tuple[TranspilerTree, lark.Token], tree.children
             )
             exprlist = None
+
+        # A qualified global function call such as ``ip.isCanonical(s)``.
+        root_name = _bare_member_ident(member_tree)
+        if root_name is not None:
+            qualified_name = f"{root_name}.{property_name_token.value}"
+            if _activation_has_function(self.activation, qualified_name):
+                args = exprlist.transpiled if exprlist is not None else ""
+                tree.transpiled = f"{self.func_name(qualified_name)}({args})"
+                return
+
         if property_name_token.value in {
             "map",
             "filter",
